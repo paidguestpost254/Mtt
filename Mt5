@@ -1,0 +1,583 @@
+# MT5 Gold (XAUUSD) AI Automatic Trading Bot
+
+Yeh raha ek complete **Python-based MT5 Gold trading bot** jo technical indicators + simple ML logic use karke automatic trades karta hai. Isme **Gold-specific settings** hain (spread, session timing, risk management).
+
+## Project Structure
+
+```
+gold_trading_bot/
+├── main.py              # Main bot entry point
+├── config.py            # Configuration (symbol, lot size, risk)
+├── strategy.py          # Trading strategy & signals
+├── mt5_connector.py     # MetaTrader 5 connection
+├── risk_manager.py      # Risk management
+├── notifier.py          # Telegram/Email alerts
+└── requirements.txt     # Dependencies
+```
+
+## Requirements
+
+<wormAction type="file" path="requirements.txt">
+MetaTrader5==5.0.46
+pandas==2.1.4
+numpy==1.24.3
+ta==0.10.2
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+schedule==1.2.1
+</wormAction>
+
+## Configuration
+
+<wormAction type="file" path="config.py">
+"""
+Gold (XAUUSD) Trading Bot Configuration
+All parameters tuned for Gold volatility and spread characteristics.
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class BotConfig:
+    """Central configuration for the trading bot."""
+
+    # --- Symbol & Timeframe ---
+    SYMBOL: str = "XAUUSD"          # Gold symbol (adjust to your broker: XAUUSD.m, GOLD, etc.)
+    TIMEFRAME: int = 1             # M1 = 1, M5 = 5, M15 = 15, H1 = 60
+    CANDLE_COUNT: int = 300        # Number of candles to fetch for analysis
+
+    # --- Trading Parameters ---
+    LOT_SIZE: float = 0.01         # Base lot size (adjust based on account balance)
+    MAX_POSITIONS: int = 1         # Max concurrent positions
+    MAGIC_NUMBER: int = 20240901   # Unique ID for bot's orders
+
+    # --- Risk Management ---
+    RISK_PER_TRADE_PCT: float = 1.0    # Risk % of equity per trade
+    MAX_DAILY_LOSS_PCT: float = 3.0    # Stop trading if daily loss exceeds this
+    MAX_DAILY_PROFIT_PCT: float = 5.0  # Stop trading if daily profit exceeds this
+    SL_POINTS: int = 200             # Stop Loss in points (200 pts = $2.00 on gold)
+    TP_POINTS: int = 400             # Take Profit in points (400 pts = $4.00 on gold)
+    TRAILING_SL_POINTS: int = 150    # Trailing stop distance
+    TRAILING_START_POINTS: int = 100 # Start trailing after this profit
+
+    # --- Strategy Parameters ---
+    EMA_FAST: int = 9
+    EMA_SLOW: int = 21
+    RSI_PERIOD: int = 14
+    RSI_OVERBOUGHT: float = 70.0
+    RSI_OVERSOLD: float = 30.0
+    MACD_FAST: int = 12
+    MACD_SLOW: int = 26
+    MACD_SIGNAL: int = 9
+    ATR_PERIOD: int = 14
+    BB_PERIOD: int = 20
+    BB_STD_DEV: float = 2.0
+    VOLUME_SPIKE_MULTIPLIER: float = 1.5
+
+    # --- Session Filter (Gold trades best during London/NY overlap) ---
+    ENABLE_SESSION_FILTER: bool = True
+    TRADING_START_HOUR: int = 8       # 8 AM server time
+    TRADING_END_HOUR: int = 20        # 8 PM server time
+
+    # --- Spread Filter ---
+    MAX_SPREAD_POINTS: int = 50       # Skip entry if spread > this (in points)
+
+    # --- Telegram Notifications ---
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    ENABLE_NOTIFICATIONS: bool = True
+
+    # --- Logging ---
+    LOG_FILE: str = "trading_bot.log"
+    LOG_LEVEL: str = "INFO"
+
+    # --- Paper Trading ---
+    PAPER_TRADING: bool = True        # Set False for live trading
+    PAPER_BALANCE: float = 10000.0    # Starting balance for paper trading
+
+    @classmethod
+    def validate(cls) -> None:
+        """Validate configuration at startup."""
+        assert cls.SYMBOL, "Symbol must be set"
+        assert cls.LOT_SIZE > 0, "Lot size must be positive"
+        assert cls.SL_POINTS > 0, "SL must be positive"
+        assert cls.TP_POINTS > 0, "TP must be positive"
+        if cls.ENABLE_SESSION_FILTER:
+            assert cls.TRADING_START_HOUR < cls.TRADING_END_HOUR, \
+                "Start hour must be before end hour"
+</wormAction>
+
+## MT5 Connector
+
+<wormAction type="file" path="mt5_connector.py">
+"""
+MetaTrader 5 connection and order execution layer.
+Handles initialization, data fetching, and order placement.
+"""
+
+import logging
+from datetime import datetime, timedelta
+from typing import Optional
+import MetaTrader5 as mt5
+import pandas as pd
+
+from config import BotConfig
+
+logger = logging.getLogger(__name__)
+
+
+class MT5Connector:
+    """Wrapper around MetaTrader 5 Python API."""
+
+    def __init__(self):
+        self.connected: bool = False
+        self.account_info = None
+        self.paper_balance: float = BotConfig.PAPER_BALANCE
+        self._init_mt5()
+
+    def _init_mt5(self) -> None:
+        """Initialize MT5 terminal connection."""
+        try:
+            if not mt5.initialize():
+                error = mt5.last_error()
+                logger.error(f"MT5 initialization failed: {error}")
+                raise ConnectionError(f"MT5 init failed: {error}")
+
+            self.account_info = mt5.account_info()
+            if self.account_info is None:
+                raise ConnectionError("Could not retrieve account info")
+
+            self.connected = True
+            logger.info(
+                f"Connected to MT5 | Account: {self.account_info.login} | "
+                f"Balance: ${self.account_info.balance:.2f} | "
+                f"Equity: ${self.account_info.equity:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"MT5 connection error: {e}")
+            raise
+
+    def shutdown(self) -> None:
+        """Close MT5 connection gracefully."""
+        if self.connected:
+            mt5.shutdown()
+            self.connected = False
+            logger.info("MT5 connection closed.")
+
+    def get_current_price(self) -> tuple:
+        """Get current bid and ask prices."""
+        tick = mt5.symbol_info_tick(BotConfig.SYMBOL)
+        if tick is None:
+            raise ConnectionError(f"No tick data for {BotConfig.SYMBOL}")
+        return tick.bid, tick.ask
+
+    def get_spread_points(self) -> int:
+        """Calculate current spread in points."""
+        symbol_info = mt5.symbol_info(BotConfig.SYMBOL)
+        if symbol_info is None:
+            raise ConnectionError(f"Symbol {BotConfig.SYMBOL} not found")
+        tick = mt5.symbol_info_tick(BotConfig.SYMBOL)
+        if tick is None:
+            return 9999
+        spread = (tick.ask - tick.bid) / symbol_info.point
+        return int(spread)
+
+    def fetch_ohlcv(self, count: int = None) -> pd.DataFrame:
+        """
+        Fetch OHLCV candlestick data from MT5.
+        Returns DataFrame with columns: open, high, low, close, volume, time
+        """
+        if count is None:
+            count = BotConfig.CANDLE_COUNT
+
+        rates = mt5.copy_rates_from_pos(
+            BotConfig.SYMBOL,
+            self._timeframe_to_const(BotConfig.TIMEFRAME),
+            0,
+            count
+        )
+
+        if rates is None or len(rates) == 0:
+            raise ConnectionError(f"No OHLCV data returned for {BotConfig.SYMBOL}")
+
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        df = df.set_index("time")
+        df = df[["open", "high", "low", "close", "tick_volume"]]
+        df.columns = ["open", "high", "low", "close", "volume"]
+        logger.debug(f"Fetched {len(df)} candles for {BotConfig.SYMBOL}")
+        return df
+
+    def place_order(
+        self,
+        direction: str,
+        lot_size: float,
+        sl: float,
+        tp: float,
+        comment: str = ""
+    ) -> Optional[int]:
+        """
+        Place a market order.
+        direction: 'buy' or 'sell'
+        Returns ticket number or None on failure.
+        """
+        if BotConfig.PAPER_TRADING:
+            return self._paper_place_order(direction, lot_size, sl, tp, comment)
+
+        symbol_info = mt5.symbol_info(BotConfig.SYMBOL)
+        if symbol_info is None:
+            logger.error(f"Symbol info not found for {BotConfig.SYMBOL}")
+            return None
+
+        tick = mt5.symbol_info_tick(BotConfig.SYMBOL)
+        if tick is None:
+            logger.error("No tick data available")
+            return None
+
+        if direction.lower() == "buy":
+            order_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+        else:
+            order_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": BotConfig.SYMBOL,
+            "volume": lot_size,
+            "type": order_type,
+            "price": price,
+            "sl": round(sl, 2),
+            "tp": round(tp, 2),
+            "deviation": 20,
+            "magic": BotConfig.MAGIC_NUMBER,
+            "comment": comment[:31],
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            logger.error(f"Order send failed: {mt5.last_error()}")
+            return None
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Order rejected: retcode={result.retcode}, comment={result.comment}")
+            return None
+
+        ticket = result.order
+        logger.info(
+            f"ORDER PLACED | {direction.upper()} {lot_size} lots @ {price:.2f} | "
+            f"SL: {sl:.2f} | TP: {tp:.2f} | Ticket: {ticket}"
+        )
+        return ticket
+
+    def close_position(self, ticket: int) -> bool:
+        """Close an existing position by ticket."""
+        if BotConfig.PAPER_TRADING:
+            return self._paper_close_position(ticket)
+
+        position = mt5.positions_get(ticket=ticket)
+        if position is None:
+            logger.warning(f"Position {ticket} not found")
+            return False
+
+        pos = position[0] if isinstance(position, tuple) else position
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            return False
+
+        if pos.type == mt5.POSITION_TYPE_BUY:
+            close_type = mt5.ORDER_TYPE_SELL
+            price = tick.bid
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price = tick.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": pos.volume,
+            "type": close_type,
+            "position": pos.ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": BotConfig.MAGIC_NUMBER,
+            "comment": "bot_close",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        result = mt5.order_send(request)
+        if result is None:
+            logger.error(f"Close order failed: {mt5.last_error()}")
+            return False
+
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(f"Close rejected: {result.retcode} {result.comment}")
+            return False
+
+        logger.info(f"Position {ticket} closed.")
+        return True
+
+    def get_open_positions(self) -> list:
+        """Get all open positions for the bot's magic number."""
+        if BotConfig.PAPER_TRADING:
+            return self._paper_positions()
+
+        positions = mt5.positions_get(symbol=BotConfig.SYMBOL)
+        if positions is None:
+            return []
+
+        bot_positions = []
+        for pos in positions:
+            if pos.magic == BotConfig.MAGIC_NUMBER:
+                bot_positions.append(pos)
+        return bot_positions
+
+    def get_equity(self) -> float:
+        """Get current equity (real or paper)."""
+        if BotConfig.PAPER_TRADING:
+            return self.paper_balance
+        info = mt5.account_info()
+        return info.equity if info else 0.0
+
+    def get_daily_pnl(self) -> float:
+        """Calculate today's PnL."""
+        if BotConfig.PAPER_TRADING:
+            return self.paper_balance - BotConfig.PAPER_BALANCE
+
+        history = mt5.history_deals_get(
+            datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+            datetime.now()
+        )
+        if history is None:
+            return 0.0
+
+        pnl = 0.0
+        for deal in history:
+            if deal.magic == BotConfig.MAGIC_NUMBER:
+                pnl += deal.profit + deal.swap + deal.commission
+        return pnl
+
+    # --- Paper Trading Simulation ---
+
+    def _paper_place_order(self, direction, lot_size, sl, tp, comment) -> Optional[int]:
+        tick = mt5.symbol_info_tick(BotConfig.SYMBOL)
+        if tick is None:
+            return None
+
+        if direction.lower() == "buy":
+            price = tick.ask
+        else:
+            price = tick.bid
+
+        ticket = int(datetime.now().timestamp() * 1000)
+        self._paper_orders = getattr(self, "_paper_orders", [])
+        self._paper_orders.append({
+            "ticket": ticket,
+            "direction": direction.lower(),
+            "lot": lot_size,
+            "entry": price,
+            "sl": sl,
+            "tp": tp,
+            "time": datetime.now()
+        })
+        logger.info(f"[PAPER] {direction.upper()} {lot_size} @ {price:.2f} SL:{sl:.2f} TP:{tp:.2f}")
+        return ticket
+
+    def _paper_close_position(self, ticket: int) -> bool:
+        orders = getattr(self, "_paper_orders", [])
+        for i, order in enumerate(orders):
+            if order["ticket"] == ticket:
+                tick = mt5.symbol_info_tick(BotConfig.SYMBOL)
+                if tick is None:
+                    return False
+                if order["direction"] == "buy":
+                    exit_price = tick.bid
+                    pnl = (exit_price - order["entry"]) * order["lot"] * 100
+                else:
+                    exit_price = tick.ask
+                    pnl = (order["entry"] - exit_price) * order["lot"] * 100
+                self.paper_balance += pnl
+                orders.pop(i)
+                logger.info(f"[PAPER] Closed ticket {ticket}, PnL: ${pnl:.2f}")
+                return True
+        return False
+
+    def _paper_positions(self) -> list:
+        return getattr(self, "_paper_orders", [])
+
+    # --- Helpers ---
+
+    @staticmethod
+    def _timeframe_to_const(tf_minutes: int) -> int:
+        mapping = {
+            1: mt5.TIMEFRAME_M1,
+            5: mt5.TIMEFRAME_M5,
+            15: mt5.TIMEFRAME_M15,
+            30: mt5.TIMEFRAME_M30,
+            60: mt5.TIMEFRAME_H1,
+            240: mt5.TIMEFRAME_H4,
+            1440: mt5.TIMEFRAME_D1,
+        }
+        return mapping.get(tf_minutes, mt5.TIMEFRAME_M15)
+</wormAction>
+
+## Strategy Engine
+
+<wormAction type="file" path="strategy.py">
+"""
+Multi-indicator trading strategy optimized for Gold (XAUUSD).
+Combines trend following, momentum, and mean-reversion signals
+with a scoring system to reduce false signals.
+"""
+
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import ta
+
+from config import BotConfig
+
+logger = logging.getLogger(__name__)
+
+
+class Signal(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+    NONE = "NONE"
+
+
+@dataclass
+class TradeSignal:
+    signal: Signal
+    confidence: float  # 0.0 to 1.0
+    reason: str
+    suggested_sl: float
+    suggested_tp: float
+    lot_multiplier: float = 1.0  # Scale lot size based on confidence
+
+
+class GoldStrategy:
+    """
+    Multi-factor strategy for Gold trading.
+    
+    Signals are scored across multiple indicator families:
+    1. Trend (EMA crossover, ADX)
+    2. Momentum (RSI, MACD, Stochastic)
+    3. Volatility (ATR, Bollinger Bands)
+    4. Volume confirmation
+    
+    A minimum score threshold must be met before generating a trade signal.
+    This reduces whipsaws common in Gold's choppy intraday action.
+    """
+
+    SCORE_THRESHOLD: float = 0.65  # Minimum composite score to trade
+    MAX_CONFIDENCE: float = 1.0
+
+    def __init__(self):
+        self.last_signal: Optional[TradeSignal] = None
+        self._indicator_cache: dict = {}
+
+    def analyze(self, df: pd.DataFrame) -> TradeSignal:
+        """
+        Run full analysis on OHLCV DataFrame.
+        Returns a TradeSignal with BUY, SELL, or NONE.
+        """
+        if len(df) < max(BotConfig.EMA_SLOW, BotConfig.BB_PERIOD, BotConfig.MACD_SLOW) + 10:
+            return TradeSignal(Signal.NONE, 0.0, "Insufficient data", 0, 0)
+
+        # Compute all indicators
+        indicators = self._compute_indicators(df)
+
+        # Score each component
+        trend_score = self._score_trend(indicators)
+        momentum_score = self._score_momentum(indicators)
+        volatility_score = self._score_volatility(indicators)
+        volume_score = self._score_volume(df, indicators)
+
+        # Weighted composite score
+        # Trend is most important for Gold directional moves
+        weights = {
+            "trend": 0.40,
+            "momentum": 0.30,
+            "volatility": 0.15,
+            "volume": 0.15,
+        }
+
+        composite_buy = (
+            weights["trend"] * trend_score["buy"] +
+            weights["momentum"] * momentum_score["buy"] +
+            weights["volatility"] * volatility_score["buy"] +
+            weights["volume"] * volume_score["buy"]
+        )
+
+        composite_sell = (
+            weights["trend"] * trend_score["sell"] +
+            weights["momentum"] * momentum_score["sell"] +
+            weights["volatility"] * volatility_score["sell"] +
+            weights["volume"] * volume_score["sell"]
+        )
+
+        # Determine signal
+        if composite_buy >= self.SCORE_THRESHOLD and composite_buy > composite_sell:
+            confidence = min(composite_buy, self.MAX_CONFIDENCE)
+            reason = self._build_reason(trend_score, momentum_score, volatility_score, volume_score, "BUY")
+            sl, tp = self._calculate_stops(df, "buy", indicators)
+            lot_mult = self._confidence_to_lot(confidence)
+            signal = TradeSignal(Signal.BUY, confidence, reason, sl, tp, lot_mult)
+            logger.info(f"SIGNAL: BUY | Confidence: {confidence:.2f} | {reason}")
+            self.last_signal = signal
+            return signal
+
+        elif composite_sell >= self.SCORE_THRESHOLD and composite_sell > composite_buy:
+            confidence = min(composite_sell, self.MAX_CONFIDENCE)
+            reason = self._build_reason(trend_score, momentum_score, volatility_score, volume_score, "SELL")
+            sl, tp = self._calculate_stops(df, "sell", indicators)
+            lot_mult = self._confidence_to_lot(confidence)
+            signal = TradeSignal(Signal.SELL, confidence, reason, sl, tp, lot_mult)
+            logger.info(f"SIGNAL: SELL | Confidence: {confidence:.2f} | {reason}")
+            self.last_signal = signal
+            return signal
+
+        else:
+            reason = f"No signal | Buy:{composite_buy:.2f} Sell:{composite_sell:.2f} (threshold:{self.SCORE_THRESHOLD})"
+            logger.debug(reason)
+            return TradeSignal(Signal.NONE, max(composite_buy, composite_sell), reason, 0, 0)
+
+    def _compute_indicators(self, df: pd.DataFrame) -> dict:
+        """Compute all technical indicators in one pass."""
+        ind = {}
+
+        # EMAs
+        ind["ema_fast"] = ta.trend.ema_indicator(df["close"], window=BotConfig.EMA_FAST)
+        ind["ema_slow"] = ta.trend.ema_indicator(df["close"], window=BotConfig.EMA_SLOW)
+
+        # ADX
+        adx = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+        ind["adx"] = adx
+        ind["plus_di"] = ta.trend.plus_di_index(df["high"], df["low"], df["close"], window=14)
+        ind["minus_di"] = ta.trend.minus_di_index(df["high"], df["low"], df["close"], window=14)
+
+        # RSI
+        ind["rsi"] = ta.momentum.rsi(df["close"], window=BotConfig.RSI_PERIOD)
+
+        # MACD
+        macd = ta.trend.macd(df["close"], window_slow=BotConfig.MACD_SLOW,
+                             window_fast=BotConfig.MACD_FAST,
+                             window_sign=BotConfig.MACD_SIGNAL)
+        ind["macd"] = macd["MACD"]
+        ind["macd_signal"] = macd["MACD_Signal"]
+        ind["macd_hist"] = macd["MACD_Hist"]
+
+        # Stochastic
+        stoch = ta.momentum.stochastic(df["high"], df["low"], df["close"],
+                                       wi
